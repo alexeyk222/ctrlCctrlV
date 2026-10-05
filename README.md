@@ -16,7 +16,8 @@ Mac → VDI
 
 | Комбинация                | Действие                                                                  |
 | ------------------------- | ------------------------------------------------------------------------- |
-| `Ctrl + Option + Cmd + 4` | Выделить область → OCR → сохранить текст в clipboard Mac                  |
+| `Ctrl + Option + Cmd + 4` | Выделить область → быстрый OCR (Qwen3.5-4B, Apple GPU) → clipboard Mac      |
+| `Ctrl + Option + Cmd + 5` | Выделить область → самый точный OCR с отступами кода (chandra-ocr-2) → clipboard |
 | `Ctrl + Option + Cmd + V` | Напечатать содержимое clipboard в активном окне через эмуляцию клавиатуры |
 | `Ctrl + Option + Cmd + R` | Перезагрузить конфигурацию Hammerspoon                                    |
 
@@ -28,8 +29,10 @@ Mac → VDI
 
 * **Hammerspoon** — горячие клавиши, screenshot, clipboard и эмуляция клавиатуры;
 * **Apple Command Line Tools / Swift** — сборка OCR;
-* встроенный в macOS **Vision Framework**;
-* `VNRecognizeTextRequest` — системный OCR Apple.
+* встроенный в macOS **Vision Framework** — OCR без дополнительных зависимостей;
+* **PaddleOCR PP-OCRv5** — выбранный OCR; Apple Vision доступен как запасной режим.
+
+Выбор движка и ограничения описаны в [разборе OCR](docs/OCR_OPTIONS.md).
 
 ---
 
@@ -46,14 +49,20 @@ cd ~/ctrlCctrlV
 ctrlCctrlV/
 ├── init.lua
 ├── scripts/
-│   └── ocr.swift
+│   ├── ocr.swift
+│   ├── ocr_paddle.py
+│   └── ocr_worker.py
+├── docs/
+│   └── OCR_OPTIONS.md
 └── README.md
 ```
 
 Назначение файлов:
 
 * `init.lua` — конфигурация Hammerspoon;
-* `scripts/ocr.swift` — OCR на Apple Vision.
+* `scripts/ocr.swift` — OCR на Apple Vision;
+* `scripts/ocr_paddle.py` — OCR на PaddleOCR.
+* `scripts/ocr_worker.py` — фоновый процесс PaddleOCR, который сохраняет модели в памяти между снимками.
 
 ---
 
@@ -223,6 +232,15 @@ cp ~/ctrlCctrlV/init.lua \
 ```bash
 cp ~/ctrlCctrlV/scripts/ocr.swift \
    ~/.hammerspoon/scripts/ocr.swift
+
+cp ~/ctrlCctrlV/scripts/ocr_paddle.py \
+   ~/.hammerspoon/scripts/ocr_paddle.py
+
+cp ~/ctrlCctrlV/scripts/ocr_worker.py \
+   ~/.hammerspoon/scripts/ocr_worker.py
+
+cp ~/ctrlCctrlV/scripts/ocr_coreml.py ~/ctrlCctrlV/scripts/prepare_coreml.py \
+   ~/.hammerspoon/scripts/
 ```
 
 ---
@@ -287,6 +305,53 @@ VDI Tools loaded ✓
 Ctrl + Option + Cmd + R
 ```
 
+## Установка PaddleOCR
+
+Профили клавиш задаются в `OCR_KEY_PROFILES` в `init.lua`: `fast`, `accurate`, `paddle`
+(PaddleOCR-VL-1.6) или `classic` (PP-OCRv5 / Apple Vision). Веса VL-моделей скачиваются заранее:
+
+```bash
+~/.hammerspoon/.venv-vl/bin/hf download mlx-community/Qwen3.5-4B-MLX-4bit
+~/.hammerspoon/.venv-vl/bin/hf download mlx-community/chandra-ocr-2-oQ8
+```
+
+Сравнение моделей на реальном скриншоте — в [docs/VL_RESULTS.md](docs/VL_RESULTS.md).
+
+На Apple Silicon используйте Python 3.9–3.13. Для данного Mac подходит `python3.12`. Создайте окружение и установите CPU-версию по [инструкции PaddlePaddle для macOS](https://www.paddlepaddle.org.cn/documentation/docs/en/install/pip/macos-pip_en.html):
+
+```bash
+python3.12 -m venv ~/.hammerspoon/.venv
+~/.hammerspoon/.venv/bin/python -m pip install paddlepaddle==3.3.0
+~/.hammerspoon/.venv/bin/python -m pip install paddleocr==3.7.0
+~/.hammerspoon/.venv/bin/python -m pip install onnxruntime==1.30.0 onnx==1.23.1
+~/.hammerspoon/.venv/bin/python -c 'import paddle; import paddleocr; paddle.utils.run_check()'
+```
+
+В текущем `init.lua` выбран `OCR_ENGINE = "paddle"`, а `PADDLE_ACCELERATOR = "auto"` на Apple Silicon направляет тяжёлый детектор текста в Core ML с `CPUAndNeuralEngine`. Распознавание символов остаётся в ONNX Runtime CPU: на тесте перенос этой части в Core ML менял знаки исходного кода. Если Core ML не скомпилирует модель, скрипт автоматически запускает обе части через быстрый ONNX CPU.
+
+`PADDLE_LANGUAGE = "ru"` выбирает модель для русского и английского; для исключительно английского кода поставьте `"en"`. Hammerspoon заранее запускает один фоновый процесс и держит модели в памяти. Максимальная сторона детектора по умолчанию — 4000 пикселей; настройка `OCR_MAX_SIDE` (минимум 960). Для возврата к PaddlePaddle CPU задайте `PADDLE_ACCELERATOR = "paddle"`, для ONNX CPU — `"onnx"`, для Apple Vision — `OCR_ENGINE = "vision"`.
+
+Детектор автоматически преобразуется в FP16 MLProgram, исходная модель сохраняется. Модели и компиляции хранятся в `~/.cache/ctrlcctrlv-coreml`; в памяти остаются четыре размера кадра, на диске — примерно восемь. Первый новый размер требует компиляции и может занимать несколько секунд. Повторный OCR больших тестовых кадров занимает около 0,8 с. Профилирование подтвердило назначение операций на Neural Engine. Результаты и ограничения точности: [испытания ANE](docs/ANE_RESULTS.md).
+
+Проверить фоновый процесс:
+
+```bash
+ps -axo pid,ppid,etime,command | rg '[o]cr_worker.py'
+```
+
+В консоли Hammerspoon после прогрева выводится выбранный backend, например:
+
+```text
+PaddleOCR worker ready: Core ML FP16 detector (CPU + ANE) / ONNX CPU recognizer
+```
+
+Проверка на одном и том же изображении:
+
+```bash
+~/.hammerspoon/scripts/ocr image.png
+~/.hammerspoon/.venv/bin/python ~/.hammerspoon/scripts/ocr_paddle.py image.png --lang ru
+```
+
 ---
 
 # 10. Использование
@@ -321,7 +386,7 @@ VDI
  ↓
 Screenshot
  ↓
-Apple Vision OCR
+Apple Vision или PaddleOCR
  ↓
 Mac clipboard
 ```
@@ -343,6 +408,8 @@ Ctrl + Option + Cmd + V
 ```
 
 Hammerspoon не использует VDI clipboard — он последовательно генерирует события клавиатуры и «печатает» текст в активное окно.
+
+`Return` и `Tab` отправляются как отдельные нажатия после отпускания клавиш горячей комбинации. Для VDI с потерей символов увеличьте `TYPING_DELAY` и `KEY_PRESS_DELAY_US` в `init.lua`. Если целевой редактор не добавляет отступ после Enter, установите `REMOVE_EDITOR_AUTO_INDENT = false`; по умолчанию скрипт выделяет автоматически добавленный отступ через `Shift+Home`, затем вводит отступ из буфера. В VS Code проверьте результат на небольшом фрагменте с несколькими строками до переноса большого файла.
 
 
 ---
@@ -381,6 +448,8 @@ xcrun swiftc \
 
 Reload Hammerspoon после изменения только `ocr.swift` не требуется.
 
+После изменения OCR скопируйте `ocr_paddle.py`, `ocr_worker.py`, `ocr_coreml.py` и `prepare_coreml.py` в `~/.hammerspoon/scripts/` и перезагрузите конфигурацию Hammerspoon; повторная сборка Swift не нужна.
+
 ---
 
 # 12. Быстрая диагностика
@@ -411,7 +480,7 @@ System Settings
 
 ---
 
-## `OCR binary not found`
+## `OCR engine not installed`
 
 Проверить:
 
@@ -419,7 +488,7 @@ System Settings
 ls -lh ~/.hammerspoon/scripts/ocr
 ```
 
-Если файла нет — повторить сборку из раздела **«Сборка OCR»**.
+Если выбран Vision и файла нет — повторить сборку из раздела **«Сборка OCR»**. Если выбран PaddleOCR — проверьте `~/.hammerspoon/.venv/bin/python`, `~/.hammerspoon/scripts/ocr_paddle.py` и `~/.hammerspoon/scripts/ocr_worker.py`.
 
 ---
 
@@ -451,6 +520,8 @@ this SDK is not supported by the compiler
 # 13. Ограничения
 
 OCR хорошо подходит для переноса текста и большинства фрагментов кода, однако распознавание исходного кода не гарантирует 100% точность.
+
+Автоматические подмены кавычек и округление отступов до четырёх пробелов удалены: оба движка оставляют распознанные символы без таких исправлений. Восстановление пробелов по координатам OCR остаётся приблизительным, особенно при пропорциональном шрифте и нескольких колонках.
 
 Особенно внимательно стоит проверять:
 
