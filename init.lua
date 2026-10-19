@@ -5,7 +5,10 @@
 --     Mac clipboard -> keyboard typing -> VDI
 --
 -- Ctrl + Option + Cmd + 4
---     Screenshot selection -> Apple Vision OCR -> clipboard
+--     Screenshot selection -> fast OCR (Qwen3.5-4B) -> clipboard
+--
+-- Ctrl + Option + Cmd + 5
+--     Screenshot selection -> most accurate OCR (chandra-ocr-2) -> clipboard
 --
 -- Ctrl + Option + Cmd + R
 --     Reload Hammerspoon config
@@ -18,16 +21,42 @@
 
 local MODIFIERS = {"ctrl", "alt", "cmd"}
 
--- Delay between typed characters.
--- Increase to 0.015-0.030 if VDI loses characters.
-local TYPING_DELAY = 0.008
+-- VDI clients need time to forward each key event.
+local TYPING_DELAY = 0.025
+
+-- keyStroke's delay is in microseconds, between key down and key up.
+local KEY_PRESS_DELAY_US = 30000
 
 -- How many timer ticks to wait after Return,
 -- so the remote editor has time to apply auto-indent.
-local NEWLINE_WAIT_TICKS = 3
+local NEWLINE_WAIT_TICKS = 4
+
+-- Set false if the remote editor does not insert its own indentation.
+local REMOVE_EDITOR_AUTO_INDENT = true
+
+-- OCR profile per hotkey: "fast" (Qwen3.5-4B), "accurate" (chandra-ocr-2),
+-- "paddle" (PaddleOCR-VL-1.6) run on the GPU via ocr_vl.py; "classic" uses OCR_ENGINE below.
+local OCR_KEY_PROFILES = {["4"] = "fast", ["5"] = "accurate"}
+
+-- Unload a VL model after this many idle seconds; nil keeps it in memory.
+local VL_IDLE_SECONDS = {fast = nil, accurate = 600, paddle = 600}
+
+-- "classic" engine: "paddle" uses PP-OCRv5; use "vision" to switch back to Apple Vision.
+local OCR_ENGINE = "paddle"
+local PADDLE_LANGUAGE = "ru" -- "ru" also recognizes English; use "en" for English-only code.
+local PADDLE_ACCELERATOR = "auto" -- Apple Silicon: FP16 Core ML detector, ONNX CPU recognizer.
 
 local OCR_BINARY =
     os.getenv("HOME") .. "/.hammerspoon/scripts/ocr"
+
+local PADDLE_PYTHON =
+    os.getenv("HOME") .. "/.hammerspoon/.venv/bin/python"
+
+local PADDLE_SCRIPT =
+    os.getenv("HOME") .. "/.hammerspoon/scripts/ocr_paddle.py"
+
+local PADDLE_WORKER_SCRIPT =
+    os.getenv("HOME") .. "/.hammerspoon/scripts/ocr_worker.py"
 
 local OCR_IMAGE =
     "/tmp/hammerspoon_ocr.png"
@@ -39,6 +68,7 @@ local OCR_IMAGE =
 ------------------------------------------------------------
 
 local typingTimer = nil
+local modifierTimer = nil
 
 
 local function utf8Chars(str)
@@ -57,6 +87,11 @@ local function stopTyping()
     if typingTimer then
         typingTimer:stop()
         typingTimer = nil
+    end
+
+    if modifierTimer then
+        modifierTimer:stop()
+        modifierTimer = nil
     end
 
 end
@@ -115,18 +150,20 @@ local function typeSlowly(text)
         -- replace the selected text.
         ----------------------------------------------------
 
-        if resetLineIndent then
+        if resetLineIndent and REMOVE_EDITOR_AUTO_INDENT then
 
             hs.eventtap.keyStroke(
                 {"shift"},
                 "home",
-                0
+                KEY_PRESS_DELAY_US
             )
 
             resetLineIndent = false
 
             return
         end
+
+        resetLineIndent = false
 
 
         ----------------------------------------------------
@@ -158,11 +195,11 @@ local function typeSlowly(text)
             hs.eventtap.keyStroke(
                 {},
                 "return",
-                0
+                KEY_PRESS_DELAY_US
             )
 
             newlineWait = NEWLINE_WAIT_TICKS
-            resetLineIndent = true
+            resetLineIndent = index < #chars
 
 
         ----------------------------------------------------
@@ -174,7 +211,7 @@ local function typeSlowly(text)
             hs.eventtap.keyStroke(
                 {},
                 "tab",
-                0
+                KEY_PRESS_DELAY_US
             )
 
 
@@ -191,6 +228,25 @@ local function typeSlowly(text)
 
         index = index + 1
 
+    end)
+
+end
+
+
+local function startWhenModifiersReleased(text)
+
+    stopTyping()
+
+    modifierTimer = hs.timer.doEvery(0.025, function()
+        local modifiers = hs.eventtap.checkKeyboardModifiers()
+
+        if modifiers.ctrl or modifiers.alt or modifiers.cmd or modifiers.shift then
+            return
+        end
+
+        modifierTimer:stop()
+        modifierTimer = nil
+        typeSlowly(text)
     end)
 
 end
@@ -226,7 +282,7 @@ hs.hotkey.bind(
         )
 
 
-        typeSlowly(text)
+        startWhenModifiersReleased(text)
 
     end
 )
@@ -234,7 +290,7 @@ hs.hotkey.bind(
 
 ------------------------------------------------------------
 -- PART 2
--- SCREENSHOT -> APPLE VISION OCR -> CLIPBOARD
+-- SCREENSHOT -> OCR -> CLIPBOARD
 ------------------------------------------------------------
 
 
@@ -253,31 +309,238 @@ local function fileExists(path)
 
 end
 
+local ocrBusy = false
+local workerTask = nil
+local workerBuffer = ""
+local workerError = ""
+local workerReady = false
+local workerRequest = nil
+local workerRequestId = 0
+local vlModule = nil
+local vlWorkers = {}
 
-local function screenshotToOCR()
+local function vlWorker(profile)
+    if not vlModule then
+        local ok, module = pcall(dofile, os.getenv("HOME") .. "/.hammerspoon/scripts/ocr_vl.lua")
+        if not ok then return nil, tostring(module) end
+        vlModule = module
+    end
+    if not vlWorkers[profile] then
+        vlWorkers[profile] = vlModule.new(profile, VL_IDLE_SECONDS[profile])
+    end
+    return vlWorkers[profile]
+end
 
+-- VL models read small text better when it is at least Retina-sized,
+-- so selections from 1x displays are upscaled twice.
+local function selectionScale()
+    local screen = hs.mouse.getCurrentScreen()
+    local mode = screen and screen:currentMode()
+    if mode and mode.scale and mode.scale >= 2 then return 1 end
+    return 2
+end
+
+local function runVLOCR(profile, callback)
+    local worker, err = vlWorker(profile)
+    if not worker then callback(2, "", err); return end
+    worker.run(OCR_IMAGE, selectionScale(), callback)
+end
+
+local function runOneShotOCR(callback)
+    local command = OCR_BINARY
+    local arguments = {OCR_IMAGE}
+    if OCR_ENGINE == "paddle" then
+        command = PADDLE_PYTHON
+        arguments = {
+            PADDLE_SCRIPT,
+            OCR_IMAGE,
+            "--lang", PADDLE_LANGUAGE,
+            "--accelerator", PADDLE_ACCELERATOR,
+        }
+    end
+
+    local task = hs.task.new(command, callback, arguments)
+    if not task or not task:start() then
+        callback(2, "", "Failed to start OCR process")
+    end
+end
+
+local function startPaddleWorker()
+    if OCR_ENGINE ~= "paddle" or
+       not fileExists(PADDLE_WORKER_SCRIPT) or
+       not fileExists(PADDLE_PYTHON) then
+        return false
+    end
+    if workerTask then
+        return true
+    end
+
+    workerBuffer = ""
+    workerError = ""
+    workerReady = false
+    local task
+    task = hs.task.new(
+        PADDLE_PYTHON,
+        function(exitCode, _, stdErr)
+            if workerTask ~= task then return end
+            workerTask = nil
+            workerReady = false
+            if stdErr and stdErr ~= "" then
+                workerError = (workerError .. stdErr):sub(-2000)
+            end
+            print("PaddleOCR worker exited:", exitCode, workerError)
+            if workerRequest then
+                local request = workerRequest
+                workerRequest = nil
+                request.timer:stop()
+                runOneShotOCR(request.callback)
+            end
+        end,
+        function(_, stdOut, stdErr)
+            if stdErr and stdErr ~= "" then
+                workerError = (workerError .. stdErr):sub(-2000)
+            end
+            workerBuffer = workerBuffer .. (stdOut or "")
+            while true do
+                local newline = workerBuffer:find("\n", 1, true)
+                if not newline then break end
+                local line = workerBuffer:sub(1, newline - 1)
+                workerBuffer = workerBuffer:sub(newline + 1)
+                local ok, response = pcall(hs.json.decode, line)
+                if ok and type(response) == "table" and response.ready then
+                    workerReady = true
+                    print("PaddleOCR worker ready:", response.backend or "unknown")
+                elseif ok and type(response) == "table" and
+                   workerRequest and response.id == workerRequest.id then
+                    local request = workerRequest
+                    workerRequest = nil
+                    request.timer:stop()
+                    if response.error then
+                        request.callback(2, "", response.error)
+                    else
+                        print("OCR backend:", response.backend or "unknown", "seconds:", response.seconds)
+                        request.callback(0, response.text or "", "")
+                    end
+                elseif line ~= "" then
+                    print("Unexpected PaddleOCR worker output:", line)
+                end
+            end
+            return true
+        end,
+        {
+            PADDLE_WORKER_SCRIPT,
+            "--lang", PADDLE_LANGUAGE,
+            "--accelerator", PADDLE_ACCELERATOR,
+        }
+    )
+
+    if not task then
+        print("Could not start PaddleOCR worker")
+        return false
+    end
+    workerTask = task
+    if not task:start() then
+        workerTask = nil
+        print("Could not start PaddleOCR worker")
+        return false
+    end
+    return true
+end
+
+local function runOCR(callback)
+    if OCR_ENGINE ~= "paddle" or not startPaddleWorker() then
+        runOneShotOCR(callback)
+        return
+    end
+
+    workerRequestId = workerRequestId + 1
+    local request = {id = workerRequestId, callback = callback}
+    workerRequest = request
+    request.timer = hs.timer.doAfter(workerReady and 30 or 120, function()
+        if workerRequest ~= request then return end
+        workerRequest = nil
+        print("PaddleOCR worker timed out; retrying once")
+        if workerTask and workerTask:isRunning() then
+            workerTask:terminate()
+        end
+        runOneShotOCR(callback)
+    end)
+
+    local input = hs.json.encode({id = request.id, image = OCR_IMAGE}) .. "\n"
+    local ok, err = pcall(function() workerTask:setInput(input) end)
+    if not ok then
+        workerRequest = nil
+        request.timer:stop()
+        print("PaddleOCR worker input failed:", err)
+        runOneShotOCR(callback)
+    end
+end
+
+local function usesProfile(profile)
+    for _, value in pairs(OCR_KEY_PROFILES) do
+        if value == profile then return true end
+    end
+    return false
+end
+
+if usesProfile("classic") and OCR_ENGINE == "paddle" then
+    startPaddleWorker()
+end
+
+-- The fast profile stays loaded, so its first hotkey press skips model loading.
+if usesProfile("fast") then
+    local worker = vlWorker("fast")
+    if worker and not worker.start() then print("Could not start fast VL OCR worker") end
+end
+
+hs.shutdownCallback = function()
+    for _, worker in pairs(vlWorkers) do worker.stop() end
+    if workerTask and workerTask:isRunning() then
+        workerTask:terminate()
+    end
+end
+
+
+local function screenshotToOCR(profile)
+    local useVL = profile ~= "classic"
+
+    if ocrBusy then
+        hs.alert.show("OCR already running")
+        return
+    end
+
+    local ocrCommand = OCR_BINARY
+    if OCR_ENGINE == "paddle" then
+        ocrCommand = PADDLE_PYTHON
+    elseif OCR_ENGINE ~= "vision" then
+        hs.alert.show("Unknown OCR engine: " .. OCR_ENGINE)
+        return
+    end
 
     --------------------------------------------------------
-    -- Check OCR binary first
+    -- Check the selected OCR backend first
     --------------------------------------------------------
 
-    if not fileExists(OCR_BINARY) then
+    if useVL then ocrCommand = os.getenv("HOME") .. "/.hammerspoon/.venv-vl/bin/python" end
+    if not fileExists(ocrCommand) or
+       (not useVL and OCR_ENGINE == "paddle" and not fileExists(PADDLE_SCRIPT)) then
 
         hs.alert.show(
-            "OCR binary not found"
+            "OCR engine not installed"
         )
 
         print(
-            "OCR binary not found:"
+            "OCR engine not installed:"
         )
 
         print(
-            OCR_BINARY
+            ocrCommand
         )
 
         return
     end
 
+    ocrBusy = true
 
     --------------------------------------------------------
     -- Remove previous temporary screenshot
@@ -318,6 +581,8 @@ local function screenshotToOCR()
 
             if exitCode ~= 0 then
 
+                ocrBusy = false
+
                 print(
                     "Screenshot cancelled or failed"
                 )
@@ -336,6 +601,8 @@ local function screenshotToOCR()
 
             if not fileExists(OCR_IMAGE) then
 
+                ocrBusy = false
+
                 hs.alert.show(
                     "Screenshot not created"
                 )
@@ -346,177 +613,39 @@ local function screenshotToOCR()
 
             ------------------------------------------------
             -- STEP 2
-            -- Run Apple Vision OCR binary
+            -- Run the selected OCR backend
             ------------------------------------------------
 
             hs.alert.show(
-                "OCR…",
-                0.5
+                useVL and ("OCR (" .. profile .. ")…") or "OCR…",
+                useVL and 2 or 0.5
             )
 
 
-            local ocrTask
+            local function onResult(ocrExitCode, text, errorText)
+                ocrBusy = false
+                os.remove(OCR_IMAGE)
 
+                if ocrExitCode ~= 0 then
+                    hs.alert.show("OCR error")
+                    print("OCR ERROR", ocrExitCode, errorText or "")
+                    return
+                end
 
-            ocrTask = hs.task.new(
+                -- The one-shot CLI appends a final newline; the worker does not.
+                if text then text = text:gsub("\n$", "") end
+                if not text or text == "" then
+                    hs.alert.show("Текст не найден")
+                    return
+                end
 
-                OCR_BINARY,
-
-
-                ------------------------------------------------
-                -- OCR callback
-                ------------------------------------------------
-
-                function(
-                    ocrExitCode,
-                    text,
-                    errorText
-                )
-
-
-                    --------------------------------------------
-                    -- OCR failed
-                    --------------------------------------------
-
-                    if ocrExitCode ~= 0 then
-
-                        hs.alert.show(
-                            "OCR error"
-                        )
-
-                        print(
-                            "OCR ERROR"
-                        )
-
-                        print(
-                            "Exit code:",
-                            ocrExitCode
-                        )
-
-
-                        if errorText and errorText ~= "" then
-
-                            print(errorText)
-
-                        end
-
-
-                        os.remove(
-                            OCR_IMAGE
-                        )
-
-                        return
-                    end
-
-
-                    --------------------------------------------
-                    -- No text
-                    --------------------------------------------
-
-                    if not text or text == "" then
-
-                        hs.alert.show(
-                            "Текст не найден"
-                        )
-
-                        os.remove(
-                            OCR_IMAGE
-                        )
-
-                        return
-                    end
-
-
-                    --------------------------------------------
-                    -- Swift print() adds final newline.
-                    --------------------------------------------
-
-                    text = text:gsub(
-                        "\n$",
-                        ""
-                    )
-
-
-                    --------------------------------------------
-                    -- Put OCR result into LOCAL Mac clipboard
-                    --------------------------------------------
-
-                    hs.pasteboard.setContents(
-                        text
-                    )
-
-
-                    --------------------------------------------
-                    -- Debug output
-                    --------------------------------------------
-
-                    print(
-                        "========== OCR RESULT =========="
-                    )
-
-                    print(text)
-
-                    print(
-                        "================================"
-                    )
-
-
-                    --------------------------------------------
-                    -- Delete temporary screenshot
-                    --------------------------------------------
-
-                    os.remove(
-                        OCR_IMAGE
-                    )
-
-
-                    --------------------------------------------
-                    -- Done
-                    --------------------------------------------
-
-                    hs.alert.show(
-                        "OCR → Clipboard ✓",
-                        1.0
-                    )
-
-                end,
-
-
-                ------------------------------------------------
-                -- Arguments for OCR binary
-                ------------------------------------------------
-
-                {
-                    OCR_IMAGE
-                }
-
-            )
-
-
-            ------------------------------------------------
-            -- Start OCR
-            ------------------------------------------------
-
-            if not ocrTask then
-
-                hs.alert.show(
-                    "Failed to create OCR task"
-                )
-
-                return
+                hs.pasteboard.setContents(text)
+                print("========== OCR RESULT ==========")
+                print(text)
+                print("================================")
+                hs.alert.show("OCR → Clipboard ✓", 1.0)
             end
-
-
-            local started = ocrTask:start()
-
-
-            if not started then
-
-                hs.alert.show(
-                    "Failed to start OCR"
-                )
-
-            end
+            if useVL then runVLOCR(profile, onResult) else runOCR(onResult) end
 
         end,
 
@@ -540,6 +669,8 @@ local function screenshotToOCR()
 
     if not screenshotTask then
 
+        ocrBusy = false
+
         hs.alert.show(
             "Failed to create screenshot task"
         )
@@ -553,6 +684,8 @@ local function screenshotToOCR()
 
     if not started then
 
+        ocrBusy = false
+
         hs.alert.show(
             "Failed to start screenshot"
         )
@@ -563,15 +696,13 @@ end
 
 
 ------------------------------------------------------------
--- HOTKEY:
--- Ctrl + Option + Cmd + 4
+-- HOTKEYS:
+-- Ctrl + Option + Cmd + 4 / 5, profiles in OCR_KEY_PROFILES
 ------------------------------------------------------------
 
-hs.hotkey.bind(
-    MODIFIERS,
-    "4",
-    screenshotToOCR
-)
+for key, profile in pairs(OCR_KEY_PROFILES) do
+    hs.hotkey.bind(MODIFIERS, key, function() screenshotToOCR(profile) end)
+end
 
 
 ------------------------------------------------------------
@@ -626,7 +757,11 @@ print(
 )
 
 print(
-    "Ctrl+Option+Cmd+4 -> Screenshot -> OCR"
+    "Ctrl+Option+Cmd+4 -> Screenshot -> OCR (" .. OCR_KEY_PROFILES["4"] .. ")"
+)
+
+print(
+    "Ctrl+Option+Cmd+5 -> Screenshot -> OCR (" .. OCR_KEY_PROFILES["5"] .. ")"
 )
 
 print(

@@ -69,32 +69,6 @@ struct Segment {
 
 
 // ---------------------------------------------------------
-// Cleanup common OCR artifacts
-// ---------------------------------------------------------
-
-func cleanup(_ input: String) -> String {
-
-    var text = input
-
-    text = text.replacingOccurrences(of: "“", with: "\"")
-    text = text.replacingOccurrences(of: "”", with: "\"")
-    text = text.replacingOccurrences(of: "‘", with: "'")
-    text = text.replacingOccurrences(of: "’", with: "'")
-
-    text = text.replacingOccurrences(of: "•#", with: "#")
-    text = text.replacingOccurrences(of: "·#", with: "#")
-
-    // Cursor is sometimes recognized as |
-    if text.hasSuffix("|") {
-        text.removeLast()
-        text = text.trimmingCharacters(in: .whitespaces)
-    }
-
-    return text
-}
-
-
-// ---------------------------------------------------------
 // Convert Vision observations
 // ---------------------------------------------------------
 
@@ -111,7 +85,7 @@ for observation in observations {
 
     segments.append(
         Segment(
-            text: cleanup(candidate.string),
+            text: candidate.string,
             x: box.minX,
             y: box.midY,
             width: box.width,
@@ -157,7 +131,7 @@ for segment in segments {
 
     let count = segment.text.count
 
-    if count >= 4 {
+    if count > 0 {
 
         let value =
             segment.width / CGFloat(count)
@@ -179,14 +153,7 @@ if charWidth <= 0 {
 // Sort segments from top to bottom
 // ---------------------------------------------------------
 
-segments.sort {
-
-    if abs($0.y - $1.y) < medianHeight * 0.5 {
-        return $0.x < $1.x
-    }
-
-    return $0.y > $1.y
-}
+segments.sort { $0.y > $1.y }
 
 
 // ---------------------------------------------------------
@@ -318,27 +285,8 @@ for row in rows {
         )
 
 
-    var leadingColumns =
+    let leadingColumns =
         max(0, rawLeadingColumns)
-
-
-    // Snap indentation approximately to Python 4-space levels.
-    //
-    // Do this only for small leading offsets.
-    // Large X differences can represent fragments rather
-    // than indentation.
-    if leadingColumns > 0 && leadingColumns <= 24 {
-
-        let level =
-            Int(
-                round(
-                    Double(leadingColumns) / 4.0
-                )
-            )
-
-        leadingColumns =
-            max(0, level * 4)
-    }
 
 
     var line =
@@ -348,56 +296,25 @@ for row in rows {
         )
 
 
-    var currentColumn =
-        leadingColumns
-
-
     // -----------------------------------------------------
     // Reconstruct every OCR fragment on this visual row
     // -----------------------------------------------------
 
     for (index, segment) in row.segments.enumerated() {
 
-        let targetColumn =
-            max(
-                0,
-                Int(
-                    round(
-                        (segment.x - leftMargin)
-                        / charWidth
-                    )
-                )
-            )
-
-
         if index > 0 {
 
-            // Determine visual gap between fragments.
-            let missingSpaces =
-                targetColumn - currentColumn
+            let previous = row.segments[index - 1]
+            let gap = segment.x - (previous.x + previous.width)
+            let spaces = max(0, Int(round(gap / charWidth)))
 
-
-            if missingSpaces > 0 {
-
-                line += String(
-                    repeating: " ",
-                    count: missingSpaces
-                )
-
-                currentColumn += missingSpaces
-
-            } else if !line.hasSuffix(" ") {
-
-                // At minimum fragments must not stick together.
-                line += " "
-                currentColumn += 1
+            if spaces > 0 {
+                line += String(repeating: " ", count: spaces)
             }
         }
 
 
         line += segment.text
-
-        currentColumn += segment.text.count
     }
 
 
